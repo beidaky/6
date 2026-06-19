@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, touch-action=none">
-    <title>物理隐形幕布 - 丝滑双指小窗版</title>
+    <title>隐形幕布 - 中心补丁版</title>
     <style>
         body { margin: 0; overflow: hidden; background-color: #111; touch-action: none; font-family: sans-serif; color: white; }
         #canvas-container { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 1; }
@@ -28,29 +28,44 @@
     </div>
 
     <script>
+        // ============================================================
+        // 核心设计说明：
+        // 1. 摄像头画面始终铺满全屏（这是"正常"的视觉基准）
+        // 2. 屏幕中央有一个固定的矩形"隐藏区"，里面藏着用户上传的图片/视频，
+        //    但平时完全看不到——因为上面盖着一块"幕布"
+        // 3. 幕布本身画的也是摄像头画面（按照幕布【静止时】的形状采样），
+        //    所以幕布静止时和周围环境融为一体，肉眼无法分辨
+        // 4. 当用手把幕布拉开/掀起，幕布形状变形偏离了隐藏区，
+        //    隐藏区里的图片/视频就会从缝隙中露出来
+        // ============================================================
+
         let videoElement;
-        let bgMedia = null; 
+        let bgMedia = null;
         let isVideo = false;
         let environmentReady = false;
 
-        // --- 双手独立追踪状态机 ---
+        // 隐藏区矩形（固定不动，定义"宝藏"所在的区域）
+        let hiddenRect = { x: 0, y: 0, w: 0, h: 0 };
+
+        // 双手追踪状态机，带宽限期释放
+        const RELEASE_GRACE_MS = 450; // 丢失追踪后，再保持多久才真正松手
         let handTrackers = [
-            { draggedPoint: null, x: 0, y: 0, active: false, pinching: false },
-            { draggedPoint: null, x: 0, y: 0, active: false, pinching: false }
+            { draggedPoint: null, x: 0, y: 0, active: false, pinching: false, lastPinchTime: 0 },
+            { draggedPoint: null, x: 0, y: 0, active: false, pinching: false, lastPinchTime: 0 }
         ];
 
-        // --- 物理引擎核心参数调优 ---
-        const cols = 35;       // 大幅增加列数，使下摆曲线极其丝滑细腻
-        const rows = 20;       // 行数
-        const iterations = 5;  // 增加物理迭代，让布料形态更稳定柔软
-        const gravity = 0.6;   // 稍稍降低重力，让布料有种轻盈飘动的质感
-        const friction = 0.95; // 气流阻尼
-        
-        let points = [];
-        let sticks = [];
-        let clothWidth, clothHeight;
+        // --- 物理引擎参数 ---
+        const cols = 35;
+        const rows = 22;
+        const iterations = 6;
+        const gravity = 0.55;
+        const friction = 0.96;
 
-        // --- Verlet 物理质点与弹簧连接线 ---
+        let points = [];       // 当前帧（可变形）的网格点
+        let restPoints = [];   // 静止状态下的网格点位置（用来采样"伪装"画面，永远不变形）
+        let sticks = [];
+        let clothW, clothH, clothOffsetX, clothOffsetY;
+
         class Point {
             constructor(x, y, pinned) {
                 this.x = x; this.y = y;
@@ -74,37 +89,36 @@
             update() {
                 let dx = this.p2.x - this.p1.x;
                 let dy = this.p2.y - this.p1.y;
-                let distance = Math.sqrt(dx * dx + dy * dy);
+                let distance = Math.sqrt(dx * dx + dy * dy) || 0.0001;
                 let difference = this.length - distance;
                 let percent = difference / distance / 2;
                 let offsetX = dx * percent;
                 let offsetY = dy * percent;
-
                 if (!this.p1.pinned) { this.p1.x -= offsetX; this.p1.y -= offsetY; }
                 if (!this.p2.pinned) { this.p2.x += offsetX; this.p2.y += offsetY; }
             }
         }
 
-        // 初始化在屏幕正中央的五分之二大小的幕布
         function initCloth() {
-            points = []; sticks = [];
-            
-            // 设定为屏幕宽度的 2/5 (40%)
-            clothWidth = windowWidth * 0.4;
-            clothHeight = windowHeight * 0.55; 
-            
-            let spacingX = clothWidth / (cols - 1);
-            let spacingY = clothHeight / (rows - 1);
-            
-            // 计算居中偏移量
-            let offsetX = (windowWidth - clothWidth) / 2;
-            let offsetY = (windowHeight - clothHeight) / 3; // 略微偏上符合视觉黄金分割
+            points = []; sticks = []; restPoints = [];
+
+            // 中心隐藏区：屏幕宽度的 2/5，居中偏上一些
+            clothW = windowWidth * 0.4;
+            clothH = windowHeight * 0.45;
+            clothOffsetX = (windowWidth - clothW) / 2;
+            clothOffsetY = (windowHeight - clothH) / 2.6;
+
+            hiddenRect = { x: clothOffsetX, y: clothOffsetY, w: clothW, h: clothH };
+
+            let spacingX = clothW / (cols - 1);
+            let spacingY = clothH / (rows - 1);
 
             for (let y = 0; y < rows; y++) {
                 for (let x = 0; x < cols; x++) {
-                    let px = offsetX + x * spacingX;
-                    let py = offsetY + y * spacingY;
-                    points.push(new Point(px, py, y === 0)); // 只有顶端一行固定
+                    let px = clothOffsetX + x * spacingX;
+                    let py = clothOffsetY + y * spacingY;
+                    points.push(new Point(px, py, y === 0)); // 顶端一行固定，像挂着
+                    restPoints.push({ x: px, y: py });        // 记录静止位置，永不改变
                 }
             }
             for (let y = 0; y < rows; y++) {
@@ -129,38 +143,39 @@
             }
             environmentReady = true;
 
-            const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
-            
-            // 开启双手模式识别
-            hands.setOptions({ 
-                maxNumHands: 2, 
-                modelComplexity: 0, 
-                minDetectionConfidence: 0.5, 
-                minTrackingConfidence: 0.5 
+            const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+            hands.setOptions({
+                maxNumHands: 2,
+                modelComplexity: 0,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
             });
             hands.onResults(onHandResults);
 
             const camera = new Camera(videoElement, {
-                onFrame: async () => { await hands.send({image: videoElement}); },
+                onFrame: async () => { await hands.send({ image: videoElement }); },
                 width: 640, height: 480
             });
-            
-            camera.start().then(() => { 
-                document.getElementById('status').innerText = "✅ 丝滑双指版就绪！请在中央幕布前用双手操作。"; 
+
+            camera.start().then(() => {
+                document.getElementById('status').innerText = "✅ 就绪！中央有一块隐形幕布，伸手去掀开它。";
                 document.getElementById('status').style.color = "#00ff00";
+            }).catch((err) => {
+                document.getElementById('status').innerText = "❌ 摄像头启动失败: " + err.message;
+                document.getElementById('status').style.color = "red";
             });
 
             document.getElementById('media-upload').addEventListener('change', (e) => {
                 let file = e.target.files[0];
                 if (!file) return;
                 let url = URL.createObjectURL(file);
-                
+
                 if (file.type.startsWith('video/')) {
-                    if (bgMedia && isVideo) bgMedia.remove(); 
+                    if (bgMedia && isVideo) bgMedia.remove();
                     bgMedia = createVideo([url]);
                     bgMedia.hide();
                     bgMedia.loop();
-                    bgMedia.volume(1); 
+                    bgMedia.volume(1);
                     isVideo = true;
                 } else {
                     if (bgMedia && isVideo) bgMedia.remove();
@@ -170,38 +185,37 @@
             });
         }
 
-        // 同时处理两只手的数据流
         function onHandResults(results) {
             let currentHands = results.multiHandLandmarks || [];
-            
+            let now = millis();
+
             for (let i = 0; i < 2; i++) {
                 if (i < currentHands.length) {
                     const landmarks = currentHands[i];
-                    let ix = (1 - landmarks[8].x) * windowWidth; 
+                    let ix = (1 - landmarks[8].x) * windowWidth;
                     let iy = landmarks[8].y * windowHeight;
-                    let tx = (1 - landmarks[4].x) * windowWidth; 
+                    let tx = (1 - landmarks[4].x) * windowWidth;
                     let ty = landmarks[4].y * windowHeight;
-                    
-                    let hX = (ix + tx) / 2; 
+
+                    let hX = (ix + tx) / 2;
                     let hY = (iy + ty) / 2;
-                    let pinching = dist(ix, iy, tx, ty) < 45; // 优化捏合判定范围
+                    let pinching = dist(ix, iy, tx, ty) < 48;
 
                     handTrackers[i].x = hX;
                     handTrackers[i].y = hY;
                     handTrackers[i].active = true;
-                    handTrackers[i].pinching = pinching;
 
                     if (pinching) {
+                        handTrackers[i].pinching = true;
+                        handTrackers[i].lastPinchTime = now; // 刷新"仍在捏合"的时间戳
+
                         if (!handTrackers[i].draggedPoint) {
-                            let minDist = 160; // 扩大抓取感应半径，更易操作
+                            let minDist = 170;
                             let targetPoint = null;
-                            
                             for (let p of points) {
                                 if (!p.pinned) {
-                                    // 避免两只手同时争抢抓取同一个物理节点
                                     let otherHand = handTrackers[1 - i];
                                     if (otherHand.draggedPoint === p) continue;
-
                                     let d = dist(hX, hY, p.x, p.y);
                                     if (d < minDist) {
                                         minDist = d;
@@ -211,13 +225,12 @@
                             }
                             handTrackers[i].draggedPoint = targetPoint;
                         }
-                    } else {
-                        handTrackers[i].draggedPoint = null;
                     }
+                    // 注意：这里即使 pinching 在这一帧是 false，
+                    // 也不立刻清空 draggedPoint —— 交给 draw() 里的宽限期判断
                 } else {
-                    handTrackers[i].draggedPoint = null;
                     handTrackers[i].active = false;
-                    handTrackers[i].pinching = false;
+                    // 手暂时从画面消失，同样交给宽限期判断，不立刻释放
                 }
             }
         }
@@ -230,78 +243,136 @@
 
             background(25);
 
-            // 1. 强制纠正被拖拽点的惯性动量（解决“不跟手/延迟”的死穴）
+            let now = millis();
+
+            // 1) 宽限期释放判断：只有真正超过 RELEASE_GRACE_MS 没有捏合信号，才松手
             for (let i = 0; i < 2; i++) {
-                if (handTrackers[i].active && handTrackers[i].pinching && handTrackers[i].draggedPoint) {
-                    let p = handTrackers[i].draggedPoint;
-                    p.x = handTrackers[i].x;
-                    p.y = handTrackers[i].y;
-                    p.oldx = handTrackers[i].x; // 强制将上一帧位置同步，抹除物理引擎的反向牵引力
-                    p.oldy = handTrackers[i].y;
+                let t = handTrackers[i];
+                if (t.draggedPoint && (now - t.lastPinchTime > RELEASE_GRACE_MS)) {
+                    t.draggedPoint = null;
+                    t.pinching = false;
                 }
             }
 
-            // 2. 更新物理引擎
+            // 2) 强制把被抓取的点钉死在指尖坐标，并清除惯性动量（杜绝"不跟手"）
+            for (let i = 0; i < 2; i++) {
+                let t = handTrackers[i];
+                if (t.draggedPoint && (now - t.lastPinchTime <= RELEASE_GRACE_MS)) {
+                    let p = t.draggedPoint;
+                    p.x = t.x;
+                    p.y = t.y;
+                    p.oldx = t.x;
+                    p.oldy = t.y;
+                }
+            }
+
+            // 3) 物理引擎迭代
             for (let p of points) p.update();
             for (let i = 0; i < iterations; i++) {
                 for (let s of sticks) s.update();
             }
 
-            // 3. 全屏绘制隐藏背景
-            if (bgMedia) {
-                image(bgMedia, 0, 0, windowWidth, windowHeight);
-            } else {
-                fill(80); textAlign(CENTER, CENTER); textSize(22); noStroke();
-                text("全屏背景区域（请在右下角上传惊喜图片或视频）", windowWidth/2, windowHeight/2);
-            }
-
-            // 4. 原生高级遮罩裁剪绘制（彻底去掉网格线条）
+            // 4) 全屏绘制摄像头画面（镜像）——这是"正常"的基准视觉
             let ctx = drawingContext;
-            ctx.save();
-            ctx.beginPath();
-            
-            // 构建闭合路径：上边缘 -> 右边缘 -> 下滑流畅底边缘 -> 左边缘
-            ctx.moveTo(points[0].x, points[0].y);
-            for(let x=1; x<cols; x++) ctx.lineTo(points[x].x, points[x].y);
-            for(let y=1; y<rows; y++) ctx.lineTo(points[cols-1 + y*cols].x, points[cols-1 + y*cols].y);
-            // 密集的节点使得这里的循环连线在拉扯时呈现极为柔软的自然垂感
-            for(let x=cols-2; x>=0; x--) ctx.lineTo(points[x + (rows-1)*cols].x, points[x + (rows-1)*cols].y);
-            for(let y=rows-2; y>0; y--) ctx.lineTo(points[y*cols].x, points[y*cols].y);
-            
-            ctx.closePath();
-            ctx.clip(); // 启用遮罩
-
-            // 在居中小窗遮罩内投射完整的全屏摄像头画面（实现光学隐藏）
             if (videoElement.readyState >= 2) {
                 ctx.save();
-                ctx.translate(windowWidth, 0); 
+                ctx.translate(windowWidth, 0);
                 ctx.scale(-1, 1);
                 ctx.drawImage(videoElement, 0, 0, windowWidth, windowHeight);
                 ctx.restore();
             }
 
-            // 【已移除】原有的网格渲染代码段，还纯净长方形幕布一色
-            
-            // 为幕布边缘增加一丝高级质感和环境空气阴影
-            ctx.strokeStyle = "rgba(0, 0, 0, 0.15)";
-            ctx.lineWidth = 3;
-            ctx.stroke();
-            
-            ctx.restore(); // 恢复正常绘制流
+            // 5) 在固定的隐藏矩形区域内，画出用户上传的图片/视频
+            //    （只在这个区域画，区域之外完全不受影响）
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(hiddenRect.x, hiddenRect.y, hiddenRect.w, hiddenRect.h);
+            ctx.clip();
+            if (bgMedia) {
+                // cover 方式铺满隐藏区，保持比例裁切
+                drawMediaCover(bgMedia, hiddenRect.x, hiddenRect.y, hiddenRect.w, hiddenRect.h);
+            } else {
+                fill(60); noStroke();
+                rect(hiddenRect.x, hiddenRect.y, hiddenRect.w, hiddenRect.h);
+                fill(150); textAlign(CENTER, CENTER); textSize(16);
+                text("请上传图片/视频\n藏在幕布后面", hiddenRect.x + hiddenRect.w / 2, hiddenRect.y + hiddenRect.h / 2);
+            }
+            ctx.restore();
 
-            // 5. 渲染双手交互的高光触控圆点提示
+            // 6) 绘制"伪装幕布"：用当前(变形后)的网格形状作为裁剪区，
+            //    但贴图内容采样自【静止位置】对应的摄像头画面，
+            //    这样幕布在没人动它的时候，会和背景严丝合缝、完全隐形。
+            //    一旦它被拉扯变形，遮罩的形状跟着移动，
+            //    但贴图取样点不跟着移动 —— 于是底下隐藏区的画面就从缝隙里露出来了。
+            ctx.save();
+            ctx.beginPath();
+            pathFromGrid(ctx, points);
+            ctx.clip();
+
+            // 用"静止采样"的方式贴摄像头画面：
+            // 简化且性能友好的做法——直接把镜像摄像头画面整张铺在原本的矩形范围内
+            // （因为 restPoints 本来就是规整矩形，相当于直接画那一块矩形对应的摄像头内容）
+            if (videoElement.readyState >= 2) {
+                ctx.save();
+                ctx.translate(windowWidth, 0);
+                ctx.scale(-1, 1);
+                ctx.drawImage(videoElement, 0, 0, windowWidth, windowHeight);
+                ctx.restore();
+            }
+
+            // 极淡的轮廓，增加一点点"似有若无"的边缘感（不画内部网格线）
+            ctx.strokeStyle = "rgba(0,0,0,0.12)";
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            ctx.restore();
+
+            // 7) 双手触控高光提示
             for (let i = 0; i < 2; i++) {
-                if (handTrackers[i].active && handTrackers[i].pinching) {
-                    fill('rgba(255, 60, 60, 0.85)'); 
-                    noStroke(); 
-                    circle(handTrackers[i].x, handTrackers[i].y, 16);
+                let t = handTrackers[i];
+                if (t.draggedPoint) {
+                    fill('rgba(255, 60, 60, 0.85)');
+                    noStroke();
+                    circle(t.x, t.y, 16);
                 }
             }
         }
 
+        // 构建网格外轮廓路径（上边 -> 右边 -> 下边 -> 左边），下边沿用密集节点保证丝滑曲线
+        function pathFromGrid(ctx, pts) {
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (let x = 1; x < cols; x++) ctx.lineTo(pts[x].x, pts[x].y);
+            for (let y = 1; y < rows; y++) ctx.lineTo(pts[cols - 1 + y * cols].x, pts[cols - 1 + y * cols].y);
+            for (let x = cols - 2; x >= 0; x--) ctx.lineTo(pts[x + (rows - 1) * cols].x, pts[x + (rows - 1) * cols].y);
+            for (let y = rows - 2; y > 0; y--) ctx.lineTo(pts[y * cols].x, pts[y * cols].y);
+            ctx.closePath();
+        }
+
+        // 以 cover 方式（保持比例，裁切多余部分）绘制图片/视频到指定矩形
+        function drawMediaCover(media, x, y, w, h) {
+            let mw = media.width, mh = media.height;
+            if (!mw || !mh) return;
+            let mediaRatio = mw / mh;
+            let boxRatio = w / h;
+            let sx, sy, sw, sh;
+            if (mediaRatio > boxRatio) {
+                sh = mh;
+                sw = mh * boxRatio;
+                sx = (mw - sw) / 2;
+                sy = 0;
+            } else {
+                sw = mw;
+                sh = mw / boxRatio;
+                sx = 0;
+                sy = (mh - sh) / 2;
+            }
+            let ctx = drawingContext;
+            let srcEl = media.elt || media.canvas;
+            ctx.drawImage(srcEl, sx, sy, sw, sh, x, y, w, h);
+        }
+
         function windowResized() {
             resizeCanvas(windowWidth, windowHeight);
-            initCloth(); 
+            initCloth();
         }
     </script>
 </body>
