@@ -3,15 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, touch-action=none">
-    <title>物理隐形幕布 - 完整体验版</title>
+    <title>物理隐形幕布 - 最终防弹版</title>
     <style>
         body { margin: 0; overflow: hidden; background-color: #111; touch-action: none; font-family: sans-serif; color: white; }
         #canvas-container { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 1; }
+        /* 隐藏源视频，仅作为数据源 */
         #webcam-video { display: none; }
         #ui-layer { position: absolute; bottom: 20px; right: 20px; z-index: 10; background: rgba(0, 0, 0, 0.7); padding: 15px; border-radius: 10px; border: 1px solid #444; }
-        .btn { background: #fff; color: #000; padding: 5px 10px; border: none; border-radius: 4px; cursor: pointer; margin-top: 5px;}
         input[type="file"] { max-width: 180px; }
-        #status { font-size: 12px; color: #aaa; margin-top: 8px; }
+        #status { font-size: 12px; color: #ffaa00; margin-top: 8px; font-weight: bold; }
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
@@ -19,29 +19,30 @@
 </head>
 <body>
 
-    <video id="webcam-video" autoplay playsinline></video>
+    <video id="webcam-video" autoplay playsinline muted></video>
     <div id="canvas-container"></div>
 
     <div id="ui-layer">
         <div>上传幕布背后的惊喜：</div>
         <input type="file" id="media-upload" accept="image/*,video/*">
-        <div id="status">正在加载 AI 模型...</div>
+        <div id="status">检查运行环境中...</div>
     </div>
 
     <script>
         // --- 核心变量 ---
-        let p5Video, videoElement;
+        let videoElement;
         let bgMedia = null; 
         let isVideo = false;
         
         let handX = 0, handY = 0;
         let isPinching = false;
         let draggedPoint = null;
+        let environmentReady = false;
 
-        // --- 物理引擎参数 (针对骁龙778G等中端机型优化) ---
-        const cols = 20; // 网格列数 
-        const rows = 15; // 网格行数
-        const iterations = 3; // 物理约束迭代次数
+        // --- 物理引擎参数 ---
+        const cols = 20; 
+        const rows = 15; 
+        const iterations = 3; 
         const gravity = 0.8;
         const friction = 0.98;
         
@@ -90,40 +91,36 @@
             spacingX = clothWidth / (cols - 1);
             spacingY = clothHeight / (rows - 1);
 
-            // 创建网格点
             for (let y = 0; y < rows; y++) {
                 for (let x = 0; x < cols; x++) {
-                    let px = x * spacingX;
-                    let py = y * spacingY;
-                    let pinned = (y === 0); // 顶端一行固定死
-                    points.push(new Point(px, py, pinned));
+                    points.push(new Point(x * spacingX, y * spacingY, y === 0));
                 }
             }
-
-            // 创建网格连接杆
             for (let y = 0; y < rows; y++) {
                 for (let x = 0; x < cols; x++) {
                     let i = x + y * cols;
-                    if (x < cols - 1) sticks.push(new Stick(points[i], points[i + 1])); // 横向
-                    if (y < rows - 1) sticks.push(new Stick(points[i], points[i + cols])); // 纵向
+                    if (x < cols - 1) sticks.push(new Stick(points[i], points[i + 1]));
+                    if (y < rows - 1) sticks.push(new Stick(points[i], points[i + cols]));
                 }
             }
         }
 
-        // --- p5.js 生命周期 ---
+        // --- 生命周期 ---
         function setup() {
             let canvas = createCanvas(windowWidth, windowHeight);
             canvas.parent('canvas-container');
 
-            // 摄像头初始化 
-            p5Video = createCapture({ video: { width: 640, height: 480 } });
-            p5Video.size(windowWidth, windowHeight);
-            p5Video.hide();
             videoElement = document.getElementById('webcam-video');
-
             initCloth();
 
-            // MediaPipe 初始化
+            // 安全校验：检查 CDN 脚本是否成功加载
+            if (typeof Hands === 'undefined' || typeof Camera === 'undefined') {
+                document.getElementById('status').innerText = "❌ 核心库加载失败，请刷新重试或检查网络";
+                document.getElementById('status').style.color = "red";
+                return;
+            }
+            environmentReady = true;
+
             const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
             hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
             hands.onResults(onHandResults);
@@ -132,9 +129,16 @@
                 onFrame: async () => { await hands.send({image: videoElement}); },
                 width: 640, height: 480
             });
-            camera.start().then(() => { document.getElementById('status').innerText = "系统就绪，请在空中捏合抓取幕布。"; });
+            
+            document.getElementById('status').innerText = "正在请求摄像头权限...";
+            camera.start().then(() => { 
+                document.getElementById('status').innerText = "✅ 魔法已就绪，请在屏幕前捏合手指！"; 
+                document.getElementById('status').style.color = "#00ff00";
+            }).catch((err) => {
+                document.getElementById('status').innerText = "❌ 摄像头启动失败: " + err.message;
+                document.getElementById('status').style.color = "red";
+            });
 
-            // 媒体上传逻辑
             document.getElementById('media-upload').addEventListener('change', (e) => {
                 let file = e.target.files[0];
                 if (!file) return;
@@ -187,45 +191,62 @@
         }
 
         function draw() {
+            if (!environmentReady) {
+                background(20);
+                return;
+            }
+
             background(30);
 
-            // 1. 物理引擎更新
             for (let p of points) p.update();
             for (let i = 0; i < iterations; i++) {
                 for (let s of sticks) s.update();
             }
 
-            // 2. 绘制底层媒体
+            // 绘制底图
             if (bgMedia) {
                 image(bgMedia, 0, 0, windowWidth, windowHeight);
             } else {
-                fill(100); textAlign(CENTER, CENTER); textSize(20);
-                text("上传媒体后，撕开幕布即可查看", windowWidth/2, windowHeight/2);
+                fill(100); textAlign(CENTER, CENTER); textSize(20); noStroke();
+                text("幕布背后是空的，请在右下角上传", windowWidth/2, windowHeight/2);
             }
 
-            // 3. 核心：光学伪装渲染
-            push();
-            beginShape();
-            for(let x=0; x<cols; x++) vertex(points[x].x, points[x].y);
-            for(let y=1; y<rows; y++) vertex(points[cols-1 + y*cols].x, points[cols-1 + y*cols].y);
-            for(let x=cols-2; x>=0; x--) vertex(points[x + (rows-1)*cols].x, points[x + (rows-1)*cols].y);
-            for(let y=rows-2; y>0; y--) vertex(points[y*cols].x, points[y*cols].y);
-            endShape(CLOSE);
+            // 纯净的原生渲染域 (杜绝状态污染)
+            let ctx = drawingContext;
+            ctx.save();
+            ctx.beginPath();
             
-            clip(); 
+            ctx.moveTo(points[0].x, points[0].y);
+            for(let x=1; x<cols; x++) ctx.lineTo(points[x].x, points[x].y);
+            for(let y=1; y<rows; y++) ctx.lineTo(points[cols-1 + y*cols].x, points[cols-1 + y*cols].y);
+            for(let x=cols-2; x>=0; x--) ctx.lineTo(points[x + (rows-1)*cols].x, points[x + (rows-1)*cols].y);
+            for(let y=rows-2; y>0; y--) ctx.lineTo(points[y*cols].x, points[y*cols].y);
+            
+            ctx.closePath();
+            ctx.clip(); 
 
-            push();
-            translate(windowWidth, 0); scale(-1, 1);
-            image(p5Video, 0, 0, windowWidth, windowHeight);
-            pop();
-
-            stroke(0, 0, 0, 40); strokeWeight(1);
-            for (let s of sticks) {
-                line(s.p1.x, s.p1.y, s.p2.x, s.p2.y);
+            // 绘制伪装层
+            if (videoElement.readyState >= 2) {
+                ctx.save();
+                ctx.translate(windowWidth, 0); 
+                ctx.scale(-1, 1);
+                ctx.drawImage(videoElement, 0, 0, windowWidth, windowHeight);
+                ctx.restore();
             }
-            pop();
 
-            // 4. 绘制手势跟踪提示
+            // 修复：完全使用原生 Canvas 接口画线，不混用 p5 的 stroke()
+            ctx.strokeStyle = "rgba(0, 0, 0, 0.25)";
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            for (let s of sticks) {
+                ctx.moveTo(s.p1.x, s.p1.y);
+                ctx.lineTo(s.p2.x, s.p2.y);
+            }
+            ctx.stroke();
+            
+            ctx.restore(); 
+
+            // 绘制手势
             if (isPinching) {
                 fill('rgba(255, 50, 50, 0.8)'); noStroke(); circle(handX, handY, 20);
             }
@@ -233,7 +254,6 @@
 
         function windowResized() {
             resizeCanvas(windowWidth, windowHeight);
-            if(p5Video) p5Video.size(windowWidth, windowHeight);
             initCloth(); 
         }
     </script>
